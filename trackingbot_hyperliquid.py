@@ -5,18 +5,19 @@ from datetime import datetime, timedelta
 from threading import Thread
 
 # --- CONFIGURATION ---
-TELEGRAM_BOT_TOKEN = "your telegram bot token/not telegram ID"
+TELEGRAM_BOT_TOKEN = "token telegram bot/not tgh ID"
 HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
 
-# data storage 
+# Data storage 
 user_subscriptions = {}  
 position_state = {}  
 last_daily_update = {}  
 
 CHECK_INTERVAL = 30
-DAILY_UPDATE_HOUR = 12
+UPDATE_HOURS = [0, 12]  
 
 # --- TELEGRAM FUNCTIONS ---
+
 def send_message(chat_id, text):
     """Send a message to a specific chat."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -24,8 +25,10 @@ def send_message(chat_id, text):
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "Markdown",
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
+        "disable_notification": False  
     }
+    
     try:
         response = requests.post(url, json=payload, timeout=10)
         return response.json().get("ok", False)
@@ -37,6 +40,7 @@ def get_updates(offset=None):
     """Get new messages from Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     params = {"timeout": 30, "offset": offset}
+    
     try:
         response = requests.get(url, params=params, timeout=35)
         return response.json().get("result", [])
@@ -45,6 +49,7 @@ def get_updates(offset=None):
         return []
 
 # --- HYPERLIQUID FUNCTIONS ---
+
 def get_positions(address):
     """Fetch all open positions for an address."""
     payload = {"type": "clearinghouseState", "user": address}
@@ -53,25 +58,48 @@ def get_positions(address):
     try:
         response = requests.post(HYPERLIQUID_API, json=payload, headers=headers, timeout=10)
         data = response.json()
-        
         positions = {}
+        
         if "assetPositions" in data:
             for item in data["assetPositions"]:
-                pos = item["position"]
-                coin = pos["coin"]
-                size = float(pos["szi"])
-                
-                if size != 0:
-                    positions[coin] = {
-                        "size": size,
-                        "entry": float(pos["entryPx"]),
-                        "pnl": float(pos["unrealizedPnl"]),
-                        "leverage": pos["leverage"]["value"],
-                        "side": "LONG" if size > 0 else "SHORT",
-                        "liq_price": float(pos.get("liquidationPx", 0)),
-                        "margin": float(pos.get("marginUsed", 0))
-                    }
+                try:
+                    pos = item["position"]
+                    coin = pos.get("coin")
+
+                    if not coin:
+                        continue
+                    
+                    size_str = pos.get("szi", "0")
+                    size = float(size_str) if size_str is not None else 0.0
+                    
+                    # Only include non-zero positions
+                    if size != 0:
+                        entry_px = pos.get("entryPx", "0")
+                        unrealized_pnl = pos.get("unrealizedPnl", "0")
+                        liq_px = pos.get("liquidationPx", "0")
+                        margin_used = pos.get("marginUsed", "0")
+                        
+                        leverage_data = pos.get("leverage", {})
+                        if isinstance(leverage_data, dict):
+                            leverage = leverage_data.get("value", "1")
+                        else:
+                            leverage = str(leverage_data) if leverage_data else "1"
+                        
+                        positions[coin] = {
+                            "size": size,
+                            "entry": float(entry_px) if entry_px is not None else 0.0,
+                            "pnl": float(unrealized_pnl) if unrealized_pnl is not None else 0.0,
+                            "leverage": leverage,
+                            "side": "LONG" if size > 0 else "SHORT",
+                            "liq_price": float(liq_px) if liq_px is not None and liq_px != "0" else 0.0,
+                            "margin": float(margin_used) if margin_used is not None else 0.0
+                        }
+                except (ValueError, TypeError, KeyError) as e:
+                    print(f"Error parsing position data for {address}: {e}")
+                    continue
+        
         return positions
+        
     except Exception as e:
         print(f"Error fetching {address}: {e}")
         return None
@@ -80,7 +108,8 @@ def format_address(address):
     """Shorten address for display."""
     return f"{address[:6]}...{address[-4:]}"
 
-# --- BOT COMMAND ---
+# --- BOT COMMAND HANDLERS ---
+
 def handle_start(chat_id):
     """Handle /start command."""
     msg = (
@@ -110,21 +139,19 @@ def handle_add(chat_id, address):
         send_message(chat_id, "❌ Invalid address format. Must be 42 characters starting with 0x")
         return
     
-    # subscription list
     if chat_id not in user_subscriptions:
         user_subscriptions[chat_id] = []
     
-    # monitoring
     if address in user_subscriptions[chat_id]:
         send_message(chat_id, f"⚠️ Already monitoring:\n`{address}`")
         return
     
-    # address
+    # Add address
     user_subscriptions[chat_id].append(address)
     
-    # position state
     if address not in position_state:
-        position_state[address] = get_positions(address) or {}
+        fetched_positions = get_positions(address)
+        position_state[address] = fetched_positions if fetched_positions is not None else {}
     
     msg = (
         f"✅ *Now Monitoring*\n"
@@ -133,11 +160,11 @@ def handle_add(chat_id, address):
         f"You'll receive alerts for:\n"
         f"• New positions opened (with leverage)\n"
         f"• Positions closed (with final PnL)\n"
-        f"• Daily summary at {DAILY_UPDATE_HOUR}:00"
+        f"• Position summaries every 12 hours (00:00 and 12:00)"
     )
     send_message(chat_id, msg)
     
-    # Show current positions
+    # Show current positions if any
     positions = position_state[address]
     if positions:
         msg = f"📊 *Current Positions:*\n\n"
@@ -146,7 +173,10 @@ def handle_add(chat_id, address):
             msg += f"Size: {abs(pos['size']):.4f} {coin}\n"
             msg += f"Entry: ${pos['entry']:,.2f}\n"
             msg += f"PnL: ${pos['pnl']:,.2f}\n"
-            msg += f"Liq: ${pos['liq_price']:,.2f}\n\n"
+            if pos['liq_price'] > 0:
+                msg += f"Liq: ${pos['liq_price']:,.2f}\n\n"
+            else:
+                msg += f"Liq: N/A\n\n"
         send_message(chat_id, msg)
 
 def handle_remove(chat_id, address):
@@ -156,7 +186,6 @@ def handle_remove(chat_id, address):
         return
     
     user_subscriptions[chat_id].remove(address)
-    
     
     if not user_subscriptions[chat_id]:
         del user_subscriptions[chat_id]
@@ -198,7 +227,11 @@ def handle_status(chat_id):
                 pnl_emoji = "🟢" if pos["pnl"] >= 0 else "🔴"
                 msg += f"{pnl_emoji} *{coin}/USD* {pos['side']} *{pos['leverage']}x*\n"
                 msg += f"Size: {abs(pos['size']):.4f} | Entry: ${pos['entry']:,.2f}\n"
-                msg += f"PnL: ${pos['pnl']:,.2f} | Liq: ${pos['liq_price']:,.2f}\n\n"
+                msg += f"PnL: ${pos['pnl']:,.2f}"
+                if pos['liq_price'] > 0:
+                    msg += f" | Liq: ${pos['liq_price']:,.2f}\n\n"
+                else:
+                    msg += f" | Liq: N/A\n\n"
         
         send_message(chat_id, msg)
 
@@ -209,44 +242,41 @@ def process_command(chat_id, text):
     
     if command == "/start" or command == "/help":
         handle_start(chat_id)
-    
     elif command == "/add":
         if len(parts) < 2:
             send_message(chat_id, "❌ Usage: `/add 0x1234...`")
         else:
             handle_add(chat_id, parts[1].strip())
-    
     elif command == "/remove":
         if len(parts) < 2:
             send_message(chat_id, "❌ Usage: `/remove 0x1234...`")
         else:
             handle_remove(chat_id, parts[1].strip())
-    
     elif command == "/list":
         handle_list(chat_id)
-    
     elif command == "/status":
         handle_status(chat_id)
-    
     else:
         send_message(chat_id, "❌ Unknown command. Send /help for available commands.")
 
-# --- monitoring ---
+# --- MONITORING FUNCTIONS ---
+
 def check_positions_for_subscribers(address):
     """Check position changes and notify all subscribers of this address."""
     current_positions = get_positions(address)
+    
     if current_positions is None:
         return
     
     old_positions = position_state.get(address, {})
     
-    # find all users monitoring this address
+    # Find all users monitoring this address
     subscribers = [chat_id for chat_id, addrs in user_subscriptions.items() if address in addrs]
     
-    # check for new positions
+    # Check for new positions
     for coin, pos in current_positions.items():
         if coin not in old_positions:
-            # position value
+            # Calculate position value
             position_value = abs(pos['size']) * pos['entry']
             
             msg = (f"🚨 *NEW POSITION OPENED*\n"
@@ -255,13 +285,17 @@ def check_positions_for_subscribers(address):
                    f"⚡ *Leverage: {pos['leverage']}x*\n\n"
                    f"Size: `{abs(pos['size']):.4f}` {coin}\n"
                    f"Value: `${position_value:,.2f}`\n"
-                   f"Entry: `${pos['entry']:,.2f}`\n"
-                   f"💀 Liq: `${pos['liq_price']:,.2f}`")
+                   f"Entry: `${pos['entry']:,.2f}`\n")
+            
+            if pos['liq_price'] > 0:
+                msg += f"💀 Liq: `${pos['liq_price']:,.2f}`"
+            else:
+                msg += f"💀 Liq: N/A"
             
             for chat_id in subscribers:
                 send_message(chat_id, msg)
     
-    # check for closed positions
+    # Check for closed positions
     for coin, old_pos in old_positions.items():
         if coin not in current_positions:
             pnl_emoji = "💰" if old_pos['pnl'] >= 0 else "💸"
@@ -278,43 +312,46 @@ def check_positions_for_subscribers(address):
             for chat_id in subscribers:
                 send_message(chat_id, msg)
     
-    # check for leverage changes 
+    # Check for leverage changes 
     for coin in current_positions:
         if coin in old_positions:
             old_size = abs(old_positions[coin]['size'])
             new_size = abs(current_positions[coin]['size'])
-            size_change_pct = abs(new_size - old_size) / old_size * 100
             
-            # alert if size changed by more than 10%
-            if size_change_pct > 10:
-                action = "INCREASED" if new_size > old_size else "DECREASED"
-                pos = current_positions[coin]
+            # Avoid division by zero
+            if old_size > 0:
+                size_change_pct = abs(new_size - old_size) / old_size * 100
                 
-                msg = (f"⚠️ *POSITION {action}*\n"
-                       f"Address: `{format_address(address)}`\n\n"
-                       f"*{coin}/USD* {pos['side']} {pos['leverage']}x\n"
-                       f"Old Size: `{old_size:.4f}` → New Size: `{new_size:.4f}`\n"
-                       f"Change: `{size_change_pct:.1f}%`\n"
-                       f"Current PnL: `${pos['pnl']:,.2f}`")
-                
-                for chat_id in subscribers:
-                    send_message(chat_id, msg)
+                # Alert if size changed by more than 10%
+                if size_change_pct > 10:
+                    action = "INCREASED" if new_size > old_size else "DECREASED"
+                    pos = current_positions[coin]
+                    
+                    msg = (f"⚠️ *POSITION {action}*\n"
+                           f"Address: `{format_address(address)}`\n\n"
+                           f"*{coin}/USD* {pos['side']} {pos['leverage']}x\n"
+                           f"Old Size: `{old_size:.4f}` → New Size: `{new_size:.4f}`\n"
+                           f"Change: `{size_change_pct:.1f}%`\n"
+                           f"Current PnL: `${pos['pnl']:,.2f}`")
+                    
+                    for chat_id in subscribers:
+                        send_message(chat_id, msg)
     
-    # update state
+    # Update state
     position_state[address] = current_positions
 
-def send_daily_summary_to_subscribers(address):
-    """Send daily summary to all subscribers of this address."""
+def send_summary_to_subscribers(address):
+    """Send 12-hour summary to all subscribers of this address."""
     positions = position_state.get(address, {})
     subscribers = [chat_id for chat_id, addrs in user_subscriptions.items() if address in addrs]
     
     if not positions:
-        msg = f"📅 *Daily Update*\n`{format_address(address)}`\n\nNo open positions"
+        msg = f"📅 *12-Hour Update*\n`{format_address(address)}`\n\nNo open positions"
     else:
         total_pnl = sum(p["pnl"] for p in positions.values())
         pnl_emoji = "📈" if total_pnl >= 0 else "📉"
         
-        msg = f"📅 *Daily Update*\n`{format_address(address)}`\n\n"
+        msg = f"📅 *12-Hour Update*\n`{format_address(address)}`\n\n"
         msg += f"{pnl_emoji} Open: {len(positions)} | Total PnL: *${total_pnl:,.2f}*\n\n"
         
         for coin, pos in positions.items():
@@ -322,15 +359,19 @@ def send_daily_summary_to_subscribers(address):
             msg += f"{pnl_emoji} *{coin}/USD* {pos['side']} *{pos['leverage']}x*\n"
             msg += f"  Size: `{abs(pos['size']):.4f}` {coin}\n"
             msg += f"  Entry: `${pos['entry']:,.2f}`\n"
-            msg += f"  PnL: `${pos['pnl']:,.2f}` | Liq: `${pos['liq_price']:,.2f}`\n\n"
+            msg += f"  PnL: `${pos['pnl']:,.2f}`"
+            if pos['liq_price'] > 0:
+                msg += f" | Liq: `${pos['liq_price']:,.2f}`\n\n"
+            else:
+                msg += f" | Liq: N/A\n\n"
     
     for chat_id in subscribers:
         key = f"{chat_id}_{address}"
         send_message(chat_id, msg)
         last_daily_update[key] = datetime.now()
 
-def should_send_daily_update(chat_id, address):
-    """Check if daily update should be sent."""
+def should_send_update(chat_id, address):
+    """Check if 12-hour update should be sent."""
     key = f"{chat_id}_{address}"
     now = datetime.now()
     
@@ -338,32 +379,32 @@ def should_send_daily_update(chat_id, address):
         last_daily_update[key] = now - timedelta(days=1)
     
     last_sent = last_daily_update[key]
-    
-    return (now.hour == DAILY_UPDATE_HOUR and now.date() > last_sent.date())
+    return (now.hour in UPDATE_HOURS and (now - last_sent).total_seconds() >= 12 * 3600)
 
 # --- MAIN LOOPS ---
+
 def monitoring_loop():
     """Background thread that monitors positions."""
     print("📊 Monitoring loop started")
     
     while True:
         try:
-            # get unique addresses being monitored
+            # Get unique addresses being monitored
             all_addresses = set()
             for addrs in user_subscriptions.values():
                 all_addresses.update(addrs)
             
-            # check each address
+            # Check each address
             for address in all_addresses:
                 check_positions_for_subscribers(address)
                 
-                # check if daily update needed
-                if datetime.now().hour == DAILY_UPDATE_HOUR:
+                # Check if daily update needed
+                if datetime.now().hour in UPDATE_HOURS:
                     subscribers = [chat_id for chat_id, addrs in user_subscriptions.items() if address in addrs]
                     for chat_id in subscribers:
-                        if should_send_daily_update(chat_id, address):
-                            send_daily_summary_to_subscribers(address)
-                            break 
+                        if should_send_update(chat_id, address):
+                            send_summary_to_subscribers(address)
+                            break  
                 
                 time.sleep(1)  
             
@@ -393,7 +434,7 @@ def bot_loop():
                     if text.startswith("/"):
                         print(f"Command from {chat_id}: {text}")
                         process_command(chat_id, text)
-            
+                        
         except KeyboardInterrupt:
             print("\n⚠️ Bot stopped by user")
             break
@@ -402,12 +443,15 @@ def bot_loop():
             time.sleep(5)
 
 # --- MAIN ---
+
 if __name__ == "__main__":
     print("🚀 Starting Multi-User Hyperliquid Monitor Bot")
     print(f"Check interval: {CHECK_INTERVAL}s")
-    print(f"Daily update: {DAILY_UPDATE_HOUR}:00\n")
+    print(f"Updates every 12 hours at: {UPDATE_HOURS}\n")
     
+    # Start monitoring in background thread
     monitor_thread = Thread(target=monitoring_loop, daemon=True)
     monitor_thread.start()
     
+    # Run bot command handler in main thread
     bot_loop()
